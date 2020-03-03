@@ -1,0 +1,210 @@
+version: "3"
+
+volumes:
+    prometheus_data: {}
+
+services:
+    joomla:
+        image: erfanemoon/joomla_img
+        hostname: joomla
+        ports: 
+           - 8081:80
+           #- 81:81
+        deploy:
+            mode: replicated
+            replicas: 1
+            placement:
+               constraints: 
+                - node.role == worker
+            labels:
+              - "traefik.enable=true"  
+              - "traefik.http.routers.joomla.rule=Host(`joomla.localhost`)"
+              - "traefik.http.routers.joomla.priority=49"
+              - "traefik.http.routers.joomla.entrypoints=web"
+              - "traefik.http.services.joomla.loadbalancer.server.port=80"
+        entrypoint: ["wait-for-it.sh", "-t", "120", "db:3306", "--", "docker-php-entrypoint", "-D FOREGROUND"] 
+        depends_on:
+            - db  
+        volumes:
+            - /gfs/joomla/:/var/www/html/
+        networks:
+            - intnet
+            #- extnet  
+        
+    pmy:
+        image: phpmyadmin/phpmyadmin
+        hostname: pmy
+        depends_on: 
+           - db
+        ports: 
+            - 8082:80
+        deploy:
+            mode: replicated
+            replicas: 1
+            placement:
+               constraints: 
+                - node.role == worker
+            labels:
+              - "traefik.enable=true"
+              - "traefik.http.routers.pmy.rule=Host(`pmy.localhost`)"
+              - "traefik.http.routers.pmy.priority=50"
+              - "traefik.http.routers.pmy.entrypoints=web"
+              - "traefik.http.services.pmy.loadbalancer.server.port=80"
+        environment:
+            DB_HOST: db
+            MYSQL_ROOT_PASSWORD: qweasd
+        volumes:
+            - /gfs/phpmyadmin:/config
+        networks:
+            - intnet
+            #- extnet  
+    db:
+        image: mariadb
+        command: --default-authentication-plugin=mysql_native_password
+        hostname: db
+        ports:
+           - 3306:3306
+        environment: 
+            MYSQL_ROOT_PASSWORD: qweasd
+        volumes:
+            - /gfs/mysql:/var/lib/mysql
+        networks:
+            - intnet
+            #- extnet  
+    prometheus:
+        image: prom/prometheus:latest
+        depends_on: 
+           - node-exporter
+           - cadvisor
+        volumes:
+            - /home/erfan/joomla/prometheus.yml:/etc/prometheus/prometheus.yml
+            - prometheus_data:/prometheus  
+              #- ./prometheus:/etc/prometheus
+              #- prometheus_data:/prometheus 
+              #- ./monitoring/prometheus/alert.rules:/etc/prometheus/alert.rules
+        command:
+            - '--config.file=/etc/prometheus/prometheus.yml'
+            - '--storage.tsdb.path=/prometheus'
+            - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+            - '--web.console.templates=/usr/share/prometheus/consoles'
+        ports:
+           - 9090:9090  
+        deploy:
+            placement:
+              constraints:
+                 - node.role == manager
+            labels:
+              - "traefik.enable=true"
+              - "traefik.http.routers.prometheus.rule=Host(`prometheus.localhost`)"
+              - "traefik.http.routers.prometheus.priority=51"
+              - "traefik.http.routers.prometheus.entrypoints=web"
+              - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+         #- "traefik.http.middlewares.test-auth.basicauth.users=test:$$apr1$$H6uskkkW$$IgXLP6ewTrSuBkTrqE8wj/,test2:$$apr1$$d9hr9HBB$$4HxwgUir3HP4EsggP/QNo0" 
+        networks:
+            - intnet
+            #- extnet  
+    node-exporter:
+        image: prom/node-exporter:latest
+        volumes:       
+            - /proc:/host/proc:ro       
+            - /sys:/host/sys:ro       
+            - /:/rootfs:ro       
+        command:       
+            - '--path.procfs=/host/proc'       
+            - '--path.sysfs=/host/sys'       
+            - '--path.rootfs=/host'       
+            - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'  
+        ports:
+            - '9100:9100'
+        deploy:       
+            mode: global 
+        networks:
+            - intnet
+              
+    grafana:
+        image: grafana/grafana:latest
+        depends_on: 
+            - prometheus
+        volumes: 
+            - /gfs/grafana:/var/lib/grafana
+        environment:
+            - GF_SECURITY_ADMIN_USER=${ADMIN_USER:-admin}
+            - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+            - GF_SERVER_DOMAIN=localhost:3000
+            - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s
+        depends_on:
+            - prometheus
+        ports:
+            - "3000:3000"
+        deploy:
+            placement:
+                constraints:
+                   - node.role == manager
+            labels:
+              - "traefik.enable=true"
+              - "traefik.http.routers.grafana.rule=Host(`grafana.localhost`)"
+              - "traefik.http.routers.grafana.priority=52"
+              - "traefik.http.routers.grafana.entrypoints=web"
+              - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+        networks:
+           - intnet
+          #- extnet  
+    cadvisor:
+        image: google/cadvisor:latest
+        #privileged: true
+        volumes:
+            - /:/rootfs:ro 
+            - /var/run:/var/run:rw
+            - /sys:/sys:ro 
+            - /var/lib/docker/:/var/lib/docker:ro 
+            #- /dev/disk/:/dev/disk:ro #
+        ports:
+           - 8084:8080
+        deploy:
+            mode: global
+        networks:
+            - intnet
+            #- extnet  
+    traefik:
+        image: "traefik:v2.0.0-rc3"
+        hostname: traefik
+        command:
+            - "--api=true"
+            - "--api.debug=true"
+            - "--api.insecure=true"
+            - "--providers.docker=true"
+            #- --traefik.http.routers.traefik.rule=Host(`traefik.localhsot`)  
+            - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+            - "--providers.docker.swarmMode=true"
+            - "--providers.docker.exposedbydefault=false"  
+            - "--providers.docker.network=app_intnet" 
+            - "--entrypoints.web.address=:80"
+        ports:
+            - "80:80"
+            - "8080:8080"
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+           #- /home/erfan/joomla/data/traefik.yml:/traefik.yml:ro
+           #- /home/erfan/joomla/data/acme.json:/acme.json  
+        deploy:
+            placement:
+                constraints:
+                    - node.role == manager
+        networks: 
+           - intnet
+           - extnet
+networks:
+      intnet:
+         internal: true
+         #driver: overlay
+         ipam:
+             #driver: default
+             config:
+                - subnet: 192.168.200.0/24
+      extnet:
+         #driver: overlay
+         #external: true
+         ipam:
+            #driver: default
+            config:
+                 - subnet: 192.168.100.0/24
